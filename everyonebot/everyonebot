@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+import time
+import sqlite3
+import re
+import json
+import random
+import os
+import configparser
+
+from pyrogram import Client
+from pyrogram.api import functions, types
+from pyrogram.api.errors import FloodWait
+from pyrogram.api.types import UpdateChatParticipants, ChatParticipants, UpdateNewChannelMessage, UpdateChannel, Message, MessageService, MessageActionChatAddUser, MessageActionChatDeleteUser, UpdateNewMessage
+from pyrogram.api.types import PeerUser, PeerChat, PeerChannel, MessageEntityMentionName
+from pyrogram.session.internals import MsgId
+
+bot_token = ''
+config = configparser.ConfigParser()
+config.read('config.ini')
+if 'pyrogram' in config and 'session_name' in config['pyrogram']:
+    bot_token = config['pyrogram']['session_name']
+
+if bot_token == '' and 'BOT_TOKEN' in os.environ:
+    bot_token = os.environ['BOT_TOKEN']
+
+if bot_token == '':
+    print("No bot token given")
+    exit(1)
+
+app = Client(bot_token)
+
+DB_PATH = 'memberships.db'
+ERROR_RE = re.compile(r'{.*}', re.DOTALL)
+MESSAGE_RE = re.compile(r'\B\@everyone\b')
+
+def decode_error(e):
+    s = str(e)
+    m = re.search(ERROR_RE, s)
+    if m == None:
+        return None
+    d = json.loads(m[0])
+    return d
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS memberships
+                     (group_id INTEGER, user_id INTEGER,
+                     PRIMARY KEY (group_id, user_id))''')
+        c.execute('''CREATE INDEX IF NOT EXISTS in_memberships_group_id
+                    ON memberships(group_id)''')
+        conn.commit()
+        print('Database initialized')
+
+def add_memberships(group_id, user_ids):
+    print('Adding to {}: {}'.format(group_id, user_ids))
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        for uid in user_ids:
+            c.execute('INSERT OR REPLACE INTO memberships VALUES (?,?)', (group_id, uid))
+        conn.commit()
+
+def remove_memberships(group_id, user_ids):
+    print('Removing from {}: {}'.format(group_id, user_ids))
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        for uid in user_ids:
+            c.execute('DELETE FROM memberships WHERE group_id = ? AND user_id = ?',
+                      (group_id, uid))
+        conn.commit()
+
+def remove_memberships_from_group(group_id):
+    print('Removing from {}'.format(group_id))
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('DELETE FROM memberships WHERE group_id = ?', (group_id,))
+        conn.commit()
+
+def get_members(group_id):
+    res = None
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        res = c.execute('SELECT user_id FROM memberships WHERE group_id = ?', (group_id,)).fetchall()
+        conn.commit()
+    return res
+
+def peer_id(p):
+    if isinstance(p, PeerUser):
+        return p.user_id
+    if isinstance(p, PeerChat):
+        return p.chat_id
+    if isinstance(p, PeerChannel):
+        return p.channel_id
+    raise Exception('Peer {} is invalid'.format(p))
+
+def get_users(target, limit=200):
+    offset = 0
+    users = []
+    while True:
+        try:
+            participants = app.send(
+                functions.channels.GetParticipants(
+                    channel=app.resolve_peer(target),
+                    filter=types.ChannelParticipantsSearch(""),
+                    offset=offset,
+                    limit=limit,
+                    hash=0
+                )
+            )
+        except FloodWait as e:
+            # Very large channels will trigger FloodWait.
+            # When happens, wait X seconds before continuing
+            time.sleep(e.x)
+            continue
+
+        if not participants.participants:
+            break  # No more participants left
+
+        users.extend(participants.users)
+        offset += limit
+    return users
+
+me = None
+
+@app.on_raw_update()
+def update(client, update, users, chats):
+    print(type(update))
+    if isinstance(update, UpdateChatParticipants):
+        if not isinstance(update.participants, ChatParticipants):
+            return
+        print('Added to group, making memberships')
+        add_memberships(update.participants.chat_id,
+                        [p.user_id for p in update.participants.participants])
+    elif isinstance(update, UpdateNewChannelMessage) and isinstance(update.message, MessageService):
+        if isinstance(update.message.action, MessageActionChatAddUser):
+            p_id = peer_id(update.message.to_id)
+            if me.id in update.message.action.users:
+                # we were added to the group
+                print('I was added. Adding averyone')
+                add_memberships(p_id, [u.id for u in get_users(p_id)])
+            else:
+                print('Someone was added')
+                add_memberships(p_id, update.message.action.users)
+        elif isinstance(update.message.action, MessageActionChatDeleteUser):
+            print('Someone was removed')
+            remove_memberships(peer_id(update.message.to_id), [update.message.action.user_id])
+    elif isinstance(update, UpdateChannel):
+        try:
+            p = app.get_chat(update.channel_id)
+        except Exception as e:
+            err = decode_error(e)
+            if 'error_message' in err:
+                remove_memberships_from_group(update.channel_id)
+    elif isinstance(update, (UpdateNewMessage, UpdateNewChannelMessage)) and isinstance(update.message, Message):
+        msg = update.message.message
+        if not re.search(MESSAGE_RE, msg):
+            return
+        members = get_members(peer_id(update.message.to_id))
+        raw_users = [x[0] for x in members]
+        users = app.get_users(raw_users)
+        usernames = ''
+        entities = []
+        for u in users:
+            if u.is_bot:
+                continue
+            if u.username:
+                usernames += ('@'+u.username)
+            else:
+                names = []
+                if u.first_name:
+                    names.append(u.first_name)
+                if u.last_name:
+                    names.append(u.last_name)
+                txt = ' '.join(names)
+                entities.append(
+                    MessageEntityMentionName(len(usernames),
+                                             len(txt), u.id))
+            usernames += ' '
+        app.send_message(update.message.to_id, usernames)
+
+init_db()
+try:
+    app.start()
+    me = app.get_me()
+    app.idle()
+except KeyboardInterrupt:
+    pass
+
+# Now the "users" list contains all the members of the target chat
